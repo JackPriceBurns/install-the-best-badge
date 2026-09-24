@@ -51,6 +51,7 @@ while True:
     pixels.show()
     frame += 1
     time.sleep(0.04)
+
 '''
 
 MARKER = b"# BRUCON_DISC_WARP_STARTUP\n"
@@ -64,7 +65,7 @@ class Connection:
                 import serial
             except ImportError as exc:
                 raise RuntimeError("Install pyserial with: py -m pip install pyserial") from exc
-            self.port = serial.Serial(name, 115200, timeout=0.1, write_timeout=1)
+            self.port = serial.Serial(name, 115200, timeout=0.05, write_timeout=1)
             self.fd = None
         else:
             import tty
@@ -78,17 +79,21 @@ class Connection:
         else:
             os.write(self.fd, data)
 
+    def read_once(self, seconds):
+        if self.port:
+            return self.port.read(self.port.in_waiting or 1)
+        if select.select([self.fd], [], [], seconds)[0]:
+            try:
+                return os.read(self.fd, 8192)
+            except BlockingIOError:
+                pass
+        return b""
+
     def read_for(self, seconds):
         deadline = time.monotonic() + seconds
         output = bytearray()
         while time.monotonic() < deadline:
-            if self.port:
-                output.extend(self.port.read(8192))
-            elif select.select([self.fd], [], [], 0.1)[0]:
-                try:
-                    output.extend(os.read(self.fd, 8192))
-                except BlockingIOError:
-                    pass
+            output.extend(self.read_once(max(0, min(0.05, deadline - time.monotonic()))))
         return bytes(output)
 
     def close(self):
@@ -119,7 +124,7 @@ def run(connection, command):
     output = bytearray()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        output.extend(connection.read_for(0.1))
+        output.extend(connection.read_once(max(0, min(0.05, deadline - time.monotonic()))))
         if output.endswith(b"\x04>"):
             break
     result = bytes(output)
@@ -134,9 +139,9 @@ def run(connection, command):
 def read_file(connection, path):
     size = int(run(connection, f"import os; print(os.stat({path!r})[6])").strip())
     chunks = []
-    for offset in range(0, size, 96):
+    for offset in range(0, size, 2048):
         statement = "import binascii; print(binascii.hexlify(open(%r,'rb').read()[%d:%d]))" % (
-            path, offset, offset + 96
+            path, offset, offset + 2048
         )
         chunks.append(binascii.unhexlify(ast.literal_eval(run(connection, statement).strip().decode())))
     result = b"".join(chunks)
@@ -147,8 +152,8 @@ def read_file(connection, path):
 
 def write_file(connection, path, data):
     run(connection, f"open({path!r},'wb').close()")
-    for offset in range(0, len(data), 96):
-        part = data[offset:offset + 96].hex()
+    for offset in range(0, len(data), 384):
+        part = data[offset:offset + 384].hex()
         run(connection, "import binascii; f=open(%r,'ab'); f.write(binascii.unhexlify(%r)); f.close()" % (path, part))
     if read_file(connection, path) != data:
         raise RuntimeError(f"Verification failed for {path}")
@@ -160,6 +165,7 @@ def main():
     args = parser.parse_args()
     connection = Connection(find_port(args.port))
     try:
+        print("Checking badge...", flush=True)
         connection.write(b"\x03")
         connection.read_for(0.4)
         for _ in range(3):
@@ -180,12 +186,13 @@ def main():
             raise RuntimeError(f"Existing backup differs from badge: {backup}")
         backup.parent.mkdir(parents=True, exist_ok=True)
         backup.write_bytes(original)
-        print(f"Original code saved to {backup}")
+        print(f"Original code saved to {backup}", flush=True)
         source = ANIMATION.encode()
         if current.startswith(MARKER):
             if read_file(connection, "/disc_warp.py") == source:
                 print("Badge is already set up")
                 return 0
+            print("Updating animation...", flush=True)
             write_file(connection, "/disc_warp_new.py", source)
             run(connection, "import os; exec(\"if 'disc_warp_old.py' in os.listdir('/'): os.remove('/disc_warp_old.py')\")")
             run(connection, "import os; os.rename('/disc_warp.py','/disc_warp_old.py')")
@@ -194,6 +201,7 @@ def main():
                 raise RuntimeError("Installed animation did not verify")
             run(connection, "import os; os.remove('/disc_warp_old.py')")
         else:
+            print("Installing animation...", flush=True)
             try:
                 existing = read_file(connection, "/code_original.py")
             except RuntimeError:
